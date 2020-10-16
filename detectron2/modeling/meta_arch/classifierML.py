@@ -36,6 +36,22 @@ def permute_to_N_HWA_K(tensor, K):
     return tensor
 
 
+def one_hot_embedding(eye ,labels):
+    """Embedding labels to one-hot form.
+
+    Args:
+      labels: (LongTensor) class labels, sized [N,].
+      num_classes: (int) number of classes.
+
+    Returns:
+      (tensor) encoded labels, sized [N, #classes].
+    """
+    one_hot_list = []
+    for label in labels:
+        one_hot_list.append(eye[labels].sum(dim=0))
+    return torch.stack(one_hot_list)
+
+
 @META_ARCH_REGISTRY.register()
 class ClassifierML(nn.Module):
 
@@ -86,7 +102,7 @@ class ClassifierML(nn.Module):
 
         self.backbone = backbone
         self.head = head
-        self.head_in_features = head_in_feature
+        self.head_in_features = head_in_features
         self.num_classes = num_classes
 
         # Loss parameters:
@@ -98,6 +114,7 @@ class ClassifierML(nn.Module):
 
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1))
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1))
+        self.eye = torch.eye(num_classes, device=self.device)
 
     @classmethod
     def from_config(cls, cfg):
@@ -110,11 +127,11 @@ class ClassifierML(nn.Module):
             "head": head,
             "pixel_mean": cfg.MODEL.PIXEL_MEAN,
             "pixel_std": cfg.MODEL.PIXEL_STD,
-            "num_classes": cfg.MODEL.RETINANET.NUM_CLASSES,
-            "head_in_features": cfg.MODEL.RETINANET.IN_FEATURES,
+            "num_classes": cfg.MODEL.CLASSIFIER_ML.NUM_CLASSES,
+            "head_in_features": cfg.MODEL.CLASSIFIER_ML.IN_FEATURES,
             # Loss parameters:
-            "focal_loss_alpha": cfg.MODEL.RETINANET.FOCAL_LOSS_ALPHA,
-            "focal_loss_gamma": cfg.MODEL.RETINANET.FOCAL_LOSS_GAMMA,
+            "focal_loss_alpha": cfg.MODEL.CLASSIFIER_ML.FOCAL_LOSS_ALPHA,
+            "focal_loss_gamma": cfg.MODEL.CLASSIFIER_ML.FOCAL_LOSS_GAMMA,
             # Vis parameters
             "vis_period": cfg.VIS_PERIOD,
             "input_format": cfg.INPUT.FORMAT,
@@ -184,16 +201,15 @@ class ClassifierML(nn.Module):
         features = self.backbone(images.tensor)
         features = [features[f] for f in self.head_in_features]
         pred_logits = self.head(features)
+        pred_logits = [permute_to_N_HWA_K(x, self.num_classes) for x in pred_logits]
 
         if self.training:
             assert "instances" in batched_inputs[0], "Instance annotations are missing in training!"
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            gt_labels = [torch.unique(inst.gt_classes) for inst in gt_instances]
 
             #change here to get gt_label from gt_instances and loss function
-            """
-            gt_labels, gt_boxes = self.label_anchors(anchors, gt_instances)
             losses = self.losses(pred_logits, gt_labels)
-            """
 
             if self.vis_period > 0:
                 storage = get_event_storage()
@@ -213,7 +229,7 @@ class ClassifierML(nn.Module):
                 processed_results.append({"classifier": results_per_image})
             return processed_results
 
-    def losses(self, anchors, pred_logits, gt_labels, pred_anchor_deltas, gt_boxes):
+    def losses(self, pred_logits, gt_labels):
         """
         Args:
             anchors (list[Boxes]): a list of #feature level Boxes
@@ -231,52 +247,20 @@ class ClassifierML(nn.Module):
                 "loss_cls" and "loss_box_reg"
         """
         num_images = len(gt_labels)
-        gt_labels = torch.stack(gt_labels)  # (N, R)
-        anchors = type(anchors[0]).cat(anchors).tensor  # (R, 4)
-        gt_anchor_deltas = [self.box2box_transform.get_deltas(anchors, k) for k in gt_boxes]
-        gt_anchor_deltas = torch.stack(gt_anchor_deltas)  # (N, R, 4)
-
-        valid_mask = gt_labels >= 0
-        pos_mask = (gt_labels >= 0) & (gt_labels != self.num_classes)
-        num_pos_anchors = pos_mask.sum().item()
-        get_event_storage().put_scalar("num_pos_anchors", num_pos_anchors / num_images)
-        self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
-            1 - self.loss_normalizer_momentum
-        ) * max(num_pos_anchors, 1)
+        gt_labels_target = one_hot_embedding(self.eye, gt_labels)  # (N, R)
+        gt_labels_target = gt_labels_target.to(pred_logits[0].device)
 
         # classification and regression loss
-        gt_labels_target = F.one_hot(gt_labels[valid_mask], num_classes=self.num_classes + 1)[
-            :, :-1
-        ]  # no loss for the last (background) class
         loss_cls = sigmoid_focal_loss_jit(
-            cat(pred_logits, dim=1)[valid_mask],
+            cat(pred_logits, dim=1).squeeze(1),
             gt_labels_target.to(pred_logits[0].dtype),
             alpha=self.focal_loss_alpha,
             gamma=self.focal_loss_gamma,
             reduction="sum",
         )
 
-        if self.box_reg_loss_type == "smooth_l1":
-            loss_box_reg = smooth_l1_loss(
-                cat(pred_anchor_deltas, dim=1)[pos_mask],
-                gt_anchor_deltas[pos_mask],
-                beta=self.smooth_l1_beta,
-                reduction="sum",
-            )
-        elif self.box_reg_loss_type == "giou":
-            pred_boxes = [
-                self.box2box_transform.apply_deltas(k, anchors)
-                for k in cat(pred_anchor_deltas, dim=1)
-            ]
-            loss_box_reg = giou_loss(
-                torch.stack(pred_boxes)[pos_mask], torch.stack(gt_boxes)[pos_mask], reduction="sum"
-            )
-        else:
-            raise ValueError(f"Invalid bbox reg loss type '{self.box_reg_loss_type}'")
-
         return {
-            "loss_cls": loss_cls / self.loss_normalizer,
-            "loss_box_reg": loss_box_reg / self.loss_normalizer,
+            "loss_cls": loss_cls ,
         }
 
     @torch.no_grad()
@@ -431,7 +415,9 @@ class ClassifierMLHead(nn.Module):
         *,
         input_shape: List[ShapeSpec],
         num_classes,
-        prior_prob
+        conv_dims: List[int],
+        prior_prob,
+        norm
     ):
         """
         NOTE: this interface is experimental.
@@ -440,10 +426,24 @@ class ClassifierMLHead(nn.Module):
             input_shape (List[ShapeSpec]): input shape
             num_classes (int): number of classes. Used to label background proposals.
         """
+        if norm == "BN" or norm == "SyncBN":
+            logger = logging.getLogger(__name__)
+            logger.warn("Shared norm does not work well for BN, SyncBN, expect poor results")
+
         super().__init__()
 
+        cls_subnet = []
+        for in_channels, out_channels in zip([input_shape[0].channels] + conv_dims, conv_dims):
+            cls_subnet.append(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            )
+            if norm:
+                cls_subnet.append(get_norm(norm, out_channels))
+            cls_subnet.append(nn.ReLU())
+
+        self.cls_subnet = nn.Sequential(*cls_subnet)
         self.cls_score = nn.Conv2d(
-            input_shape[0], num_classes, kernel_size=1, stride=1, padding=0
+            conv_dims[-1], num_classes, kernel_size=1, stride=1, padding=0
         )
 
         # Initialization
@@ -463,6 +463,8 @@ class ClassifierMLHead(nn.Module):
             "input_shape": input_shape,
             "num_classes": cfg.MODEL.RETINANET.NUM_CLASSES,
             "prior_prob": cfg.MODEL.RETINANET.PRIOR_PROB,
+            "conv_dims": [input_shape[0].channels] * cfg.MODEL.RETINANET.NUM_CONVS,
+            "norm": cfg.MODEL.RETINANET.NORM,
         }
 
     def forward(self, features):
@@ -479,6 +481,7 @@ class ClassifierMLHead(nn.Module):
         """
         logits = []
         for feature in features:
+            feature = self.cls_subnet(feature)
             feature = F.adaptive_avg_pool2d(feature, (1, 1))
             logits.append(self.cls_score(feature))
         return logits
